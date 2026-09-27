@@ -1,1 +1,401 @@
 
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Mini Standoff</title>
+<style>
+  body { margin:0; overflow:hidden; background:#000; font-family:Arial; }
+  #hud {
+    position:fixed; bottom:20px; left:20px; color:#fff;
+    font-size:22px; text-shadow:2px 2px 4px #000; z-index:10;
+  }
+  #crosshair {
+    position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+    color:#0f0; font-size:26px; z-index:10; pointer-events:none;
+  }
+  #info {
+    position:fixed; top:20px; left:20px; color:#fff;
+    font-size:16px; text-shadow:2px 2px 4px #000; z-index:10;
+  }
+  #center {
+    position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+    color:#fff; font-size:32px; text-align:center; z-index:20;
+    background:rgba(0,0,0,0.7); padding:30px 50px; border-radius:10px;
+    cursor:pointer; user-select:none;
+  }
+  #hitmarker {
+    position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+    color:red; font-size:40px; z-index:11; pointer-events:none; opacity:0;
+    transition:opacity 0.1s;
+  }
+</style>
+</head>
+<body>
+<div id="crosshair">+</div>
+<div id="hitmarker">✕</div>
+<div id="hud">HP: <span id="hp">100</span> | Патроны: <span id="ammo">30</span>/<span id="maxAmmo">30</span> | Убийств: <span id="kills">0</span></div>
+<div id="info">WASD — движение | Мышь — обзор | ЛКМ — стрелять | R — перезарядка | Shift — бег</div>
+<div id="center">НАЖМИ, ЧТОБЫ ИГРАТЬ<br><small style="font-size:16px">Стреляй по красным врагам</small></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ============ ИНИЦИАЛИЗАЦИЯ ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 20, 100);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+// ============ СВЕТ ============
+const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambient);
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(20, 40, 20);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -50;
+sun.shadow.camera.right = 50;
+sun.shadow.camera.top = 50;
+sun.shadow.camera.bottom = -50;
+scene.add(sun);
+
+// ============ ПОЛ ============
+const groundGeo = new THREE.PlaneGeometry(200, 200);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x4a6741 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ============ СТЕНЫ / УКРЫТИЯ ============
+const obstacles = [];
+function createBox(x, y, z, w, h, d, color = 0x8b7355) {
+  const geo = new THREE.BoxGeometry(w, h, d);
+  const mat = new THREE.MeshStandardMaterial({ color });
+  const box = new THREE.Mesh(geo, mat);
+  box.position.set(x, y, z);
+  box.castShadow = true;
+  box.receiveShadow = true;
+  scene.add(box);
+  obstacles.push(box);
+  return box;
+}
+
+// Стены арены
+createBox(0, 2.5, -40, 80, 5, 2, 0x696969);
+createBox(0, 2.5, 40, 80, 5, 2, 0x696969);
+createBox(-40, 2.5, 0, 2, 5, 80, 0x696969);
+createBox(40, 2.5, 0, 2, 5, 80, 0x696969);
+
+// Укрытия
+createBox(10, 1.5, 10, 4, 3, 4, 0xa0522d);
+createBox(-10, 1.5, -10, 4, 3, 4, 0xa0522d);
+createBox(15, 1.5, -15, 3, 3, 6, 0xa0522d);
+createBox(-15, 1.5, 15, 6, 3, 3, 0xa0522d);
+createBox(0, 1, 0, 5, 2, 5, 0xa0522d);
+createBox(20, 1.5, 5, 4, 3, 4, 0xa0522d);
+createBox(-20, 1.5, -5, 4, 3, 4, 0xa0522d);
+
+// ============ ИГРОК ============
+const player = {
+  pos: new THREE.Vector3(0, 1.7, 20),
+  vel: new THREE.Vector3(),
+  yaw: 0,
+  pitch: 0,
+  hp: 100,
+  onGround: true
+};
+const PLAYER_HEIGHT = 1.7;
+const PLAYER_RADIUS = 0.4;
+const SPEED = 6;
+const RUN_SPEED = 10;
+
+// ============ ОРУЖИЕ ============
+let ammo = 30;
+let maxAmmo = 30;
+let kills = 0;
+let canShoot = true;
+let reloading = false;
+
+// Модель оружия в руках
+const gunGroup = new THREE.Group();
+const gunBody = new THREE.Mesh(
+  new THREE.BoxGeometry(0.1, 0.1, 0.5),
+  new THREE.MeshStandardMaterial({ color: 0x222222 })
+);
+gunBody.position.set(0, 0, -0.3);
+gunGroup.add(gunBody);
+const gunBarrel = new THREE.Mesh(
+  new THREE.BoxGeometry(0.05, 0.05, 0.3),
+  new THREE.MeshStandardMaterial({ color: 0x111111 })
+);
+gunBarrel.position.set(0, 0.02, -0.6);
+gunGroup.add(gunBarrel);
+gunGroup.position.set(0.3, -0.3, -0.5);
+camera.add(gunGroup);
+scene.add(camera);
+
+// ============ ВРАГИ ============
+const enemies = [];
+const ENEMY_SPEED = 2;
+
+function spawnEnemy() {
+  const angle = Math.random() * Math.PI * 2;
+  const dist = 25 + Math.random() * 15;
+  const x = Math.cos(angle) * dist;
+  const z = Math.sin(angle) * dist;
+
+  const group = new THREE.Group();
+  // Тело
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(0.8, 1.2, 0.5),
+    new THREE.MeshStandardMaterial({ color: 0xcc2222 })
+  );
+  body.position.y = 0.6;
+  body.castShadow = true;
+  group.add(body);
+  // Голова
+  const head = new THREE.Mesh(
+    new THREE.BoxGeometry(0.5, 0.5, 0.5),
+    new THREE.MeshStandardMaterial({ color: 0xffcc99 })
+  );
+  head.position.y = 1.5;
+  head.castShadow = true;
+  group.add(head);
+  // Ноги
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.8, 0.3), legMat);
+  legL.position.set(-0.2, -0.4, 0);
+  group.add(legL);
+  const legR = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.8, 0.3), legMat);
+  legR.position.set(0.2, -0.4, 0);
+  group.add(legR);
+
+  group.position.set(x, 0.8, z);
+  scene.add(group);
+
+  enemies.push({
+    mesh: group,
+    hp: 3,
+    shootCooldown: 1 + Math.random() * 2
+  });
+}
+
+// Спавним 5 врагов
+for (let i = 0; i < 5; i++) spawnEnemy();
+
+// ============ УПРАВЛЕНИЕ ============
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyR') reload();
+});
+addEventListener('keyup', e => keys[e.code] = false);
+
+let pointerLocked = false;
+const centerEl = document.getElementById('center');
+centerEl.addEventListener('click', () => renderer.domElement.requestPointerLock());
+
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === renderer.domElement;
+  centerEl.style.display = pointerLocked ? 'none' : 'block';
+});
+
+document.addEventListener('mousemove', e => {
+  if (!pointerLocked) return;
+  player.yaw -= e.movementX * 0.002;
+  player.pitch -= e.movementY * 0.002;
+  player.pitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, player.pitch));
+});
+
+document.addEventListener('mousedown', e => {
+  if (e.button === 0 && pointerLocked) shoot();
+});
+
+// ============ СТРЕЛЬБА ============
+const raycaster = new THREE.Raycaster();
+
+function shoot() {
+  if (!canShoot || reloading) return;
+  if (ammo <= 0) { reload(); return; }
+
+  ammo--;
+  canShoot = false;
+  updateHUD();
+
+  // Отдача камеры
+  player.pitch += 0.02;
+  gunGroup.position.z = -0.4;
+  setTimeout(() => gunGroup.position.z = -0.5, 50);
+
+  // Луч из центра экрана
+  raycaster.setFromCamera({ x: 0, y: 0 }, camera);
+
+  // Собираем все меши врагов
+  const enemyMeshes = [];
+  enemies.forEach(e => {
+    e.mesh.traverse(c => { if (c.isMesh) { c.userData.enemy = e; enemyMeshes.push(c); } });
+  });
+
+  const hits = raycaster.intersectObjects([...enemyMeshes, ...obstacles]);
+
+  if (hits.length > 0) {
+    const hit = hits[0];
+    const enemy = hit.object.userData.enemy;
+    if (enemy) {
+      enemy.hp--;
+      showHitmarker();
+      if (enemy.hp <= 0) {
+        scene.remove(enemy.mesh);
+        const idx = enemies.indexOf(enemy);
+        if (idx > -1) enemies.splice(idx, 1);
+        kills++;
+        updateHUD();
+        setTimeout(spawnEnemy, 1500);
+      }
+    }
+  }
+
+  setTimeout(() => canShoot = false, 100);
+  setTimeout(() => canShoot = true, 100);
+}
+
+function reload() {
+  if (reloading || ammo === maxAmmo) return;
+  reloading = true;
+  setTimeout(() => {
+    ammo = maxAmmo;
+    reloading = false;
+    updateHUD();
+  }, 1500);
+}
+
+function showHitmarker() {
+  const hm = document.getElementById('hitmarker');
+  hm.style.opacity = '1';
+  setTimeout(() => hm.style.opacity = '0', 150);
+}
+
+// ============ HUD ============
+function updateHUD() {
+  document.getElementById('hp').textContent = Math.max(0, Math.floor(player.hp));
+  document.getElementById('ammo').textContent = ammo;
+  document.getElementById('maxAmmo').textContent = maxAmmo;
+  document.getElementById('kills').textContent = kills;
+}
+
+// ============ КОЛЛИЗИИ ============
+function checkCollision(newPos) {
+  for (const obs of obstacles) {
+    const box = new THREE.Box3().setFromObject(obs);
+    // Расширяем бокс на радиус игрока
+    box.expandByScalar(PLAYER_RADIUS);
+    if (
+      newPos.x > box.min.x && newPos.x < box.max.x &&
+      newPos.z > box.min.z && newPos.z < box.max.z &&
+      newPos.y > box.min.y && newPos.y - PLAYER_HEIGHT < box.max.y
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ============ ОБНОВЛЕНИЕ ============
+let prevTime = performance.now();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const time = performance.now();
+  const dt = Math.min((time - prevTime) / 1000, 0.1);
+  prevTime = time;
+
+  // Движение игрока
+  if (pointerLocked) {
+    const speed = keys['ShiftLeft'] ? RUN_SPEED : SPEED;
+    const forward = new THREE.Vector3(-Math.sin(player.yaw), 0, -Math.cos(player.yaw));
+    const right = new THREE.Vector3(Math.cos(player.yaw), 0, -Math.sin(player.yaw));
+    const move = new THREE.Vector3();
+
+    if (keys['KeyW']) move.add(forward);
+    if (keys['KeyS']) move.sub(forward);
+    if (keys['KeyD']) move.add(right);
+    if (keys['KeyA']) move.sub(right);
+
+    if (move.lengthSq() > 0) {
+      move.normalize().multiplyScalar(speed * dt);
+      const tryX = player.pos.clone(); tryX.x += move.x;
+      if (!checkCollision(tryX)) player.pos.x = tryX.x;
+      const tryZ = player.pos.clone(); tryZ.z += move.z;
+      if (!checkCollision(tryZ)) player.pos.z = tryZ.z;
+    }
+
+    // Прыжок
+    if (keys['Space'] && player.onGround) {
+      player.vel.y = 5;
+      player.onGround = false;
+    }
+    player.vel.y -= 15 * dt;
+    player.pos.y += player.vel.y * dt;
+    if (player.pos.y <= PLAYER_HEIGHT) {
+      player.pos.y = PLAYER_HEIGHT;
+      player.vel.y = 0;
+      player.onGround = true;
+    }
+  }
+
+  camera.position.copy(player.pos);
+  camera.rotation.order = 'YXZ';
+  camera.rotation.y = player.yaw;
+  camera.rotation.x = player.pitch;
+
+  // Враги — идут к игроку
+  enemies.forEach(enemy => {
+    const dir = new THREE.Vector3().subVectors(player.pos, enemy.mesh.position);
+    dir.y = 0;
+    const dist = dir.length();
+    dir.normalize();
+
+    if (dist > 2) {
+      const newPos = enemy.mesh.position.clone().addScaledVector(dir, ENEMY_SPEED * dt);
+      enemy.mesh.position.x = newPos.x;
+      enemy.mesh.position.z = newPos.z;
+    }
+
+    enemy.mesh.lookAt(player.pos.x, enemy.mesh.position.y, player.pos.z);
+
+    // Враг стреляет
+    enemy.shootCooldown -= dt;
+    if (enemy.shootCooldown <= 0 && dist < 20) {
+      enemy.shootCooldown = 1.5 + Math.random();
+      player.hp -= 10;
+      updateHUD();
+      if (player.hp <= 0) {
+        player.hp = 100;
+        player.pos.set(0, PLAYER_HEIGHT, 20);
+        kills = Math.max(0, kills - 1);
+        updateHUD();
+        alert('Ты погиб! Респавн...');
+      }
+    }
+  });
+
+  renderer.render(scene, camera);
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+updateHUD();
+animate();
+</script>
+</body>
+</html>
